@@ -890,11 +890,62 @@ def recommend(user_id, filter_following):
     - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
     """
 
-    recommended_posts = {} 
+    # get the posts user has reacted to
+    liked_posts = query_db('''
+        SELECT p.content FROM posts p
+        JOIN reactions r ON p.id = r.post_id
+        WHERE r.user_id = ?
+    ''', (user_id,))
 
-    return recommended_posts;
+    # if there aren't any, return 5 most recent posts -> recommend them
+    if not liked_posts:
+        return query_db('''
+            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+            FROM posts p JOIN users u ON p.user_id = u.id
+            WHERE p.user_id != ? ORDER BY p.created_at DESC LIMIT 5
+        ''', (user_id,))
+
+    #find common words from the liked posts
+    word_counts = collections.Counter()
+    #a list of comman words to ignore
+    stop_words = {'a', 'an', 'the', 'in', 'on', 'is', 'it', 'to', 'for', 'of', 'and', 'with'}
+    
+    for post in liked_posts:
+        # Use regex to find all words in the post content
+        words = re.findall(r'\b\w+\b', post['content'].lower())
+        for word in words:
+            if word not in stop_words and len(word) > 2:
+                word_counts[word] += 1
+    
+    #get 10 of the most used words
+    top10_words = [word for word, _ in word_counts.most_common(10)]
+
+    query = "SELECT p.id, p.content, p.created_at, u.username, u.id as user_id FROM posts p JOIN users u ON p.user_id = u.id"
+    params = []
+    
+    # If filtering by following, add a WHERE clause to only include followed users
+    if filter_following:
+        query += " WHERE p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)"
+        params.append(user_id)
+        
+    all_other_posts = query_db(query, tuple(params))
+    
+    recommended_posts = []
+    liked_post_ids = {post['id'] for post in query_db('SELECT post_id as id FROM reactions WHERE user_id = ?', (user_id,))}
+
+    for post in all_other_posts:
+        if post['id'] in liked_post_ids or post['user_id'] == user_id:
+            continue
+        
+        if any(keyword in post['content'].lower() for keyword in top10_words):
+            recommended_posts.append(post)
+
+    recommended_posts.sort(key=lambda p: p['created_at'], reverse=True)
+    
+    return recommended_posts[:5]
 
 # Task 3.2
+#Rule 2.1: Post & Comment Risk Score
 def user_risk_analysis(user_id):
     """
     Args:
@@ -908,10 +959,117 @@ def user_risk_analysis(user_id):
             password: admin
         Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
-    
-    score = 0
 
-    return score;
+    base_score = 0
+    base_score_post = 0
+    average_post_score=0
+    base_score_comment = 0
+    average_comment_score=0
+
+    count=0
+    
+    user_posts = query_db('SELECT content FROM posts WHERE user_id = ?', (user_id,))
+    for post in user_posts:
+        _, post_risk_score = moderate_content(post['content'])
+        base_score_post += post_risk_score
+        count+=1
+
+    #calculate average for post_risk_score
+    if count > 0:
+        average_post_score = base_score_post / count
+    else:
+        average_post_score = 0
+
+    count=0      #reset the count
+    user_comments = query_db('SELECT content FROM comments WHERE user_id = ?', (user_id,))
+    for comment in user_comments:
+        _, comment_risk_score = moderate_content(comment['content'])
+        base_score_comment += comment_risk_score
+        count+=1
+
+    #calculate average fro comment_risk_score
+    if count > 0:
+        average_comment_score = base_score_post / count
+    else:
+        average_comment_score = 0
+
+    
+
+    user_created_at = query_db('SELECT created_at FROM users WHERE id = ?', (user_id,), one=True)
+    #created_at = datetime.strptime(user_created_at['created_at'], "%Y-%m-%d %H:%M:%S")
+    created_at_value = user_created_at['created_at']
+    if isinstance(created_at_value, datetime):
+        created_at = created_at_value
+    else:
+        # Otherwise, parse from string
+        created_at = datetime.strptime(created_at_value, "%Y-%m-%d %H:%M:%S")
+    age= (datetime.now() - created_at).days
+
+    #yht.
+    base_score = base_score_post + base_score_comment
+
+    #i don't understand what we need these for, I'm just following the instructions
+    if age < 7:
+        risk_score = base_score * 1.5
+    else:
+        risk_score = base_score
+
+
+    #Rule 2.2: User Risk Score
+    user_profile = query_db('SELECT profile FROM users WHERE id = ?', (user_id,), one=True)
+    profile_text = user_profile['profile'] if user_profile and user_profile['profile'] else ""
+    _, profile_score = moderate_content(profile_text)
+
+    content_risk_score = (profile_score * 1) + (average_post_score * 3) + (average_comment_score * 1)
+
+    if age < 7:
+        user_risk_score = content_risk_score * 1.5
+    elif age < 30:
+        user_risk_score = content_risk_score * 1.2
+    else:
+        user_risk_score = content_risk_score
+
+
+    #MY OWN RULE
+    #to give an additional risk score based on spamming behaviour in the last week.
+    #since we still want active users the weight added to the user_risk_score is based on how much the total activity is in increments
+    posts_24h = query_db('SELECT COUNT(*) as count FROM posts WHERE user_id = ? AND created_at > datetime("now", "-7 day")', (user_id,), one=True)
+    comments_24h = query_db('SELECT COUNT(*) as count FROM comments WHERE user_id = ? AND created_at > datetime("now", "-7 day")', (user_id,), one=True)
+
+    total_activity = (posts_24h["count"] if posts_24h else 0) + (comments_24h["count"] if comments_24h else 0)
+
+    if total_activity > 50:
+        user_risk_score += 2.0  #spammer
+    elif total_activity > 30:
+        user_risk_score += 1.0   # possible spammer
+    elif total_activity > 20:
+        user_risk_score += 0.5   # very active user
+    elif total_activity > 10:
+        user_risk_score += 0.2   # active user  
+
+    user_risk_score = min(user_risk_score, 5.0)
+    
+
+    return round(user_risk_score, 2)
+    
+"""
+#function to identify the top 5 most high risk users.
+def high_risk_users():
+    users_risk = []
+
+    for user in query_db('SELECT id FROM users'):
+        #profile_score
+        content_score = user_risk_analysis(user['id'])
+        #the average
+        #average_comment_score as well
+        users_risk.append((user['id'], content_score))
+
+    users_risk.sort(key=lambda x: x[1], reverse=True)
+    
+    top5_users = users_risk[:5]
+    print(top5_users)
+    return top5_users
+"""
 
     
 # Task 3.3
@@ -932,8 +1090,57 @@ def moderate_content(content):
     Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
 
-    moderated_content = content
-    score = 0
+    if not content:  # added to handle empty content
+        return "", 0.0
+    
+    original_content = content
+    score = 0.0
+
+    #Stage 1.1: Severe Violation Checks
+    #Rule 1.1.1
+    for word in TIER1_WORDS:
+        match1 = re.search(rf"\b{re.escape(word)}\b", original_content, flags=re.IGNORECASE)
+        if match1:
+            return "[content removed due to severe violation]", 5.0
+        
+    #Rule 1.1.2
+    for phrase in TIER2_PHRASES:
+        match2 = re.search(rf"\b{re.escape(phrase)}\b", original_content, flags=re.IGNORECASE)
+        if match2:
+            return "[content removed due to spam/scam policy]", 5.0
+        
+    #Stage 1.2: Scored Violations & Filtering
+    #Rule 1.2.1
+    TIER3_PATTERN = r'\b(' + '|'.join(TIER3_WORDS) + r')\b'
+    matches3 = re.findall(TIER3_PATTERN, original_content, flags=re.IGNORECASE)
+    score += len(matches3) * 2.0
+    moderated_content = re.sub(TIER3_PATTERN, lambda m: '*' * len(m.group(0)), original_content, flags=re.IGNORECASE)
+
+    #Rule 1.2.2
+    #filtered based on most common starts and ends to urls and onse i could find from posts
+    url_pattern = re.compile(r"(https?://[^\s]+|www\.[^\s]+|[a-zA-Z0-9.-]+\.(com|org|net|io|info|co|us|uk|fi|fake|click|link|news)(/[^\s]*)?)", re.IGNORECASE)
+    links = url_pattern.findall(original_content)
+    if links:
+        score += 2.0 *len(links) 
+        moderated_content = url_pattern.sub("[link removed]", original_content)
+
+
+    #Rule 1.2.3
+    letters = [l for l in original_content if l.isalpha()]
+    if len(letters) > 15:
+        count = 0 
+        for l in letters: 
+            if l.isupper():
+                count += 1
+        if count / len(letters) > 0.7:
+            score += 0.5
+
+    #MY OWN RULE
+    #Rule of content length. To keep the servers running properly and stop i.e. flooding attacks, limit the lenght of postable content 
+    # added a very simple rule limiting the content. If the content is too long it is removed and given a score of 5.0, a high risk score.
+    #Chose 2500 as the content on the site is usually short and the server capacity is probably not that great
+    if (len(original_content) > 2500):
+        return "[content removed due to excessive length]", 5.0
     
     return moderated_content, score
 
